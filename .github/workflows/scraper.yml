@@ -1,8 +1,8 @@
 name: amazon-scraper-pro
 
 on:
-  schedule:
-    - cron: "0 0 * * *"  # 毎日 9:00 JST（UTC 0:00）
+  # schedule:
+  #   - cron: "0 0 * * *"  # 毎日 9:00 JST（UTC 0:00）
   workflow_dispatch:
 
 jobs:
