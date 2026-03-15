@@ -1,0 +1,27 @@
+name: amazon-scraper-pro
+
+on:
+  schedule:
+    - cron: "0 0 * * *"  # 毎日 9:00 JST（UTC 0:00）
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
+        run: python scraper_pro.py
