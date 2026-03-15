@@ -17,7 +17,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # CONFIG
 # ==============================
 
-SPREADSHEET_ID = "1zbUXPWO5JZW1ouHKQMX1SxdiZwVgCK-E0XjOfZDpAR0"
+SPREADSHEET_ID = "1DMxbjF2RfxA7S-Q2sPMnO2A5c7t7wXRdxS2flclPXPw"
 SCRAPER_API_KEY = os.environ["SCRAPER_API_KEY"]
 
 USER_AGENTS = [
