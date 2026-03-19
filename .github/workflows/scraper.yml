@@ -6,9 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  run:
+  scrape:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -20,8 +19,16 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run scraper
+      # ── Amazon スクレイピング ──────────────────────────────────
+      - name: Run Amazon scraper
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
         run: python scraper_pro.py
+
+      # ── Google Trends 取得（Amazon 完了後に実行）────────────────
+      - name: Run Trends scraper
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python trends_scraper.py
+        continue-on-error: true
