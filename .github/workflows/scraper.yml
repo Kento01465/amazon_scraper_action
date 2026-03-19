@@ -19,4 +19,5 @@ jobs:
       - name: Run Trends scraper
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
         run: python trends_scraper.py
