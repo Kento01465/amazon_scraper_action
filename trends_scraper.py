@@ -110,7 +110,7 @@ def fetch_scraperapi(url, label=""):
             scraper_url = (
                 f"http://api.scraperapi.com"
                 f"?api_key={SCRAPER_API_KEY}"
-                f"&url={urllib.parse.quote(url, safe=':/?=&')}"
+                f"&url={urllib.parse.quote(url, safe='')}"  # URLをまるごとエンコード
                 f"&country_code=jp"
                 f"&render=true"
                 f"&wait=5000"    # JS描画完了まで5秒待つ
@@ -185,10 +185,10 @@ def parse_trend_score(html: str, keyword: str) -> int | None:
 # ==============================
 
 def fetch_trend_score(keyword: str) -> int | None:
-    encoded = urllib.parse.quote(keyword)
+    # URLはエンコードせずそのまま渡す（fetch_scraperapi内でまとめてエンコード）
     url = (
         f"https://trends.google.co.jp/trends/explore"
-        f"?q={encoded}&geo=JP&hl=ja&date=now+1-d"
+        f"?q={keyword}&geo=JP&hl=ja&date=now+1-d"
     )
     logging.info(f"[{keyword}] URL: {url}")
 
