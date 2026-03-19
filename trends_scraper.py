@@ -1,43 +1,57 @@
 """
 trends_scraper.py
 ─────────────────────────────────────────────────────────
-Google Trends の検索スコアを取得して Sheets の "trends" シートに追記する
-既存の scraper_pro.py と同じ認証・Sheets 接続パターンを使用
+Google Trends の検索スコアを ScraperAPI 経由で取得して
+Sheets の "trends" シートに追記する
 
-依存: pip install pytrends gspread oauth2client
-（requirements.txt に追記してください）
+pytrends の 429 問題を回避するため ScraperAPI を使用
+scraper_pro.py と同じ認証・fetch パターン
 """
 
 import json
 import os
+import re
 import time
+import random
 import logging
+import requests
+import urllib3
 from datetime import datetime, timezone, timedelta
-from pytrends.request import TrendReq
+from bs4 import BeautifulSoup
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================
 # CONFIG
 # ==============================
 
-SPREADSHEET_ID   = "1DMxbjF2RfxA7S-Q2sPMnO2A5c7t7wXRdxS2flclPXPw"  # scraper_pro.py と同じ
-TRENDS_SHEET     = "trends"       # 書き込み先シート名
-JAN_SHEET        = "jan_list"     # 商品一覧シート（キーワード取得元）
+SPREADSHEET_ID = "1DMxbjF2RfxA7S-Q2sPMnO2A5c7t7wXRdxS2flclPXPw"
+TRENDS_SHEET   = "trends"
+JAN_SHEET      = "jan_list"
+SCRAPER_API_KEY = os.environ["SCRAPER_API_KEY"]
 
-# jan_list から自動取得するほか、固定キーワードを追加したい場合はここに書く
+# 取得するキーワード（ボリュームのある上位カテゴリ推奨）
 EXTRA_KEYWORDS = [
     "カビ取り剤",
     "洗濯槽クリーナー",
     "風呂釜洗浄",
-    "浴槽 配管 掃除",
+    "浴槽掃除",
+    "配管掃除"
     "クリーンプラネット",
+    "大掃除",
+    "カビ掃除",
+    "洗濯槽 掃除",
+    "風呂 掃除",
+    "梅雨 カビ対策",
 ]
 
-JST = timezone(timedelta(hours=9))
+RETRY = 3
+JST   = timezone(timedelta(hours=9))
 
 # ==============================
-# LOGGING（scraper_pro.py と同形式）
+# LOGGING
 # ==============================
 
 logging.basicConfig(
@@ -46,8 +60,7 @@ logging.basicConfig(
 )
 
 # ==============================
-# GOOGLE SHEETS AUTH
-# scraper_pro.py と完全に同じ認証パターン
+# GOOGLE SHEETS AUTH（scraper_pro.py と同じ）
 # ==============================
 
 def connect_sheets():
@@ -59,10 +72,8 @@ def connect_sheets():
     credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
     client      = gspread.authorize(credentials)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    jan_sheet   = spreadsheet.worksheet(JAN_SHEET)
 
-    jan_sheet = spreadsheet.worksheet(JAN_SHEET)
-
-    # trends シートがなければ自動作成
     try:
         trends_sheet = spreadsheet.worksheet(TRENDS_SHEET)
     except gspread.exceptions.WorksheetNotFound:
@@ -73,71 +84,148 @@ def connect_sheets():
     return jan_sheet, trends_sheet
 
 # ==============================
-# キーワード収集
-# jan_list の product_name 列（4列目）+ EXTRA_KEYWORDS
+# キーワード収集（jan_list + EXTRA_KEYWORDS）
 # ==============================
 
 def collect_keywords(jan_sheet) -> list:
-    rows = jan_sheet.get_all_values()
-    # jan_list の列構成: jan | asin | ... | product_name（4列目がある場合）
-    # 商品名が取れる場合は使う。なければ EXTRA_KEYWORDS のみ
+    rows  = jan_sheet.get_all_values()
     names = []
     for r in rows[1:]:
         if len(r) >= 4 and r[3].strip():
-            # 長い商品名はそのまま使うとノイズになるので先頭の短縮名を取る
-            name = r[3].strip()
-            # 「クリーンプラネット 風呂釜のカビ丸洗浄 ...」→ 先頭2単語に絞る
-            short = " ".join(name.split()[:2])
+            short = " ".join(r[3].strip().split()[:2])
             if short and short not in names:
                 names.append(short)
-
-    keywords = list(dict.fromkeys(names + EXTRA_KEYWORDS))  # 重複排除・順序保持
+    keywords = list(dict.fromkeys(names + EXTRA_KEYWORDS))
     logging.info(f"収集キーワード ({len(keywords)}件): {keywords}")
     return keywords
 
 # ==============================
-# pytrends でスコア取得
+# FETCH: ScraperAPI（scraper_pro.py と同じパターン）
+# ==============================
+
+def fetch_scraperapi(url, label=""):
+    session = requests.Session()
+    session.verify = False
+
+    for attempt in range(1, RETRY + 1):
+        try:
+            scraper_url = (
+                f"http://api.scraperapi.com"
+                f"?api_key={SCRAPER_API_KEY}"
+                f"&url={url}"
+                f"&country_code=jp"
+                f"&render=true"      # JS レンダリングON（Trends は JS 必須）
+                f"&cache=false"
+            )
+            r = session.get(scraper_url, timeout=60, verify=False)
+            if r.status_code == 200:
+                return r.text
+            logging.warning(f"[{label}] ScraperAPI HTTP {r.status_code} ({attempt}/{RETRY})")
+        except Exception as e:
+            logging.warning(f"[{label}] ScraperAPI error ({attempt}/{RETRY}): {e}")
+        time.sleep(random.uniform(4, 8))
+
+    return None
+
+# ==============================
+# Google Trends CSV エンドポイントで取得
+# ScraperAPI 経由で CSV を直接ダウンロードする
+# ==============================
+
+def fetch_trend_score_csv(keyword: str) -> int | None:
+    """
+    Google Trends の CSV エクスポートエンドポイントを使用
+    過去7日間の平均スコアを返す
+    """
+    import urllib.parse
+
+    encoded  = urllib.parse.quote(keyword)
+    # CSV エンドポイント（ブラウザからダウンロードできるものと同じ）
+    csv_url  = (
+        f"https://trends.google.co.jp/trends/api/widgetdata/multiline/csv"
+        f"?req=%7B%22time%22%3A%22now+7-d%22%2C%22resolution%22%3A%22HOUR%22"
+        f"%2C%22locale%22%3A%22ja%22%2C%22comparisonItem%22%3A%5B%7B%22geo%22"
+        f"%3A%7B%22country%22%3A%22JP%22%7D%2C%22complexKeywordsRestriction%22"
+        f"%3A%7B%22keyword%22%3A%5B%7B%22type%22%3A%22BROAD%22%2C%22value%22"
+        f"%3A%22{encoded}%22%7D%5D%7D%7D%5D%2C%22requestOptions%22%3A%7B%7D%7D"
+        f"&token=APP6_UEAAAAAaBC&tz=-540"
+    )
+
+    html = fetch_scraperapi(csv_url, label=keyword)
+    if not html:
+        return None
+
+    # CSV をパースして平均スコアを計算
+    lines  = [l for l in html.strip().split("\n") if l and not l.startswith("#") and not l.startswith("日")]
+    scores = []
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) >= 2:
+            try:
+                scores.append(int(parts[1].strip()))
+            except ValueError:
+                continue
+
+    if not scores:
+        logging.warning(f"[{keyword}] スコアデータなし")
+        return None
+
+    avg = round(sum(scores) / len(scores))
+    logging.info(f"[{keyword}] 平均スコア: {avg} (データ点数: {len(scores)})")
+    return avg
+
+# ==============================
+# フォールバック: Interest Over Time API
+# ==============================
+
+def fetch_trend_score_api(keyword: str) -> int | None:
+    """
+    Google Trends の内部 API エンドポイントを ScraperAPI 経由で叩く
+    CSV が取れない場合のフォールバック
+    """
+    import urllib.parse
+
+    encoded = urllib.parse.quote(json.dumps([{"keyword": keyword, "geo": "JP", "time": "now 7-d"}]))
+    api_url = (
+        f"https://trends.google.co.jp/trends/api/explore"
+        f"?hl=ja&tz=-540&req={encoded}&type=TIMESERIES&property="
+    )
+
+    html = fetch_scraperapi(api_url, label=f"{keyword}[api]")
+    if not html:
+        return None
+
+    # レスポンスから数値を抽出
+    numbers = re.findall(r'"value":\[(\d+)\]', html)
+    if not numbers:
+        logging.warning(f"[{keyword}] API レスポンスからスコア抽出失敗")
+        return None
+
+    scores = [int(n) for n in numbers]
+    avg    = round(sum(scores) / len(scores))
+    logging.info(f"[{keyword}] API 平均スコア: {avg}")
+    return avg
+
+# ==============================
+# トレンドスコア取得（メイン）
 # ==============================
 
 def fetch_trends(keywords: list) -> dict:
-    pytrends = TrendReq(hl="ja-JP", tz=540)
     scores = {}
-    BATCH = 5
+    for kw in keywords:
+        logging.info(f"取得中: {kw}")
 
-    for i in range(0, len(keywords), BATCH):
-        batch = keywords[i:i + BATCH]
-        logging.info(f"Trends取得: {batch}")
+        # まず CSV エンドポイントを試す
+        score = fetch_trend_score_csv(kw)
 
-        try:
-            pytrends.build_payload(
-                batch,
-                cat=0,
-                timeframe="now 7-d",
-                geo="JP",
-                gprop="",
-            )
-            df = pytrends.interest_over_time()
+        # 取れなければ API エンドポイントで再試行
+        if score is None:
+            logging.info(f"[{kw}] CSV失敗 → API フォールバック")
+            score = fetch_trend_score_api(kw)
 
-            # ↓ デバッグ追加
-            logging.info(f"DataFrame shape: {df.shape}")
-            logging.info(f"DataFrame:\n{df.to_string()}")  # 追加
-
-            if df.empty:
-                logging.warning(f"データなし: {batch}")
-                for kw in batch:
-                    scores[kw] = None
-            else:
-                latest = df.iloc[-1]
-                for kw in batch:
-                    scores[kw] = int(latest[kw]) if kw in latest else None
-                    logging.info(f"  {kw}: {scores[kw]}")
-
-        except Exception as e:
-            logging.warning(f"pytrends error ({batch}): {e}")
-            for kw in batch:
-                scores[kw] = None
-
-        time.sleep(3)
+        scores[kw] = score
+        logging.info(f"[{kw}] 最終スコア: {score}")
+        time.sleep(random.uniform(5, 10))  # レート制限対策
 
     return scores
 
