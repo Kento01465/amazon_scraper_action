@@ -1,9 +1,13 @@
 """
 trends_scraper.py
 ─────────────────────────────────────────────────────────
-Google Trends の「インタレストの平均値（24時間）」を
-ScraperAPI の JS レンダリング経由で画面から直接取得し
-Sheets の "trends" シートに追記する
+Google Trends の内部 JSON API を ScraperAPI 経由で叩いて
+24時間のトレンドスコア（平均値）を取得し Sheets に追記する
+
+JSレンダリング不要 → 安定して取得できる
+手順:
+  1. /trends/api/explore でトークン取得
+  2. /trends/api/widgetdata/multiline でスコア取得
 """
 
 import json
@@ -16,7 +20,6 @@ import requests
 import urllib3
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from bs4 import BeautifulSoup
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -98,10 +101,11 @@ def collect_keywords(jan_sheet) -> list:
     return keywords
 
 # ==============================
-# FETCH: ScraperAPI + JS レンダリング
+# FETCH: ScraperAPI（レンダリングなし）
 # ==============================
 
 def fetch_scraperapi(url, label=""):
+    """ScraperAPI 経由で URL を取得（JS レンダリングなし）"""
     session = requests.Session()
     session.verify = False
 
@@ -110,14 +114,12 @@ def fetch_scraperapi(url, label=""):
             scraper_url = (
                 f"http://api.scraperapi.com"
                 f"?api_key={SCRAPER_API_KEY}"
-                f"&url={urllib.parse.quote(url, safe='')}"  # URLをまるごとエンコード
+                f"&url={urllib.parse.quote(url, safe='')}"
                 f"&country_code=jp"
-                f"&render=true"
-                f"&wait=5000"    # JS描画完了まで5秒待つ
                 f"&cache=false"
             )
-            r = session.get(scraper_url, timeout=90, verify=False)
-            if r.status_code == 200 and len(r.text) > 500:
+            r = session.get(scraper_url, timeout=60, verify=False)
+            if r.status_code == 200 and len(r.text) > 100:
                 return r.text
             logging.warning(f"[{label}] HTTP {r.status_code} len={len(r.text)} ({attempt}/{RETRY})")
         except Exception as e:
@@ -127,77 +129,110 @@ def fetch_scraperapi(url, label=""):
     return None
 
 # ==============================
-# Google Trends ページから平均値を抽出
-#
-# 取得するページ:
-# https://trends.google.co.jp/trends/explore?q=カビ掃除&geo=JP&hl=ja&date=now+1-d
-#
-# 右側に表示される「インタレストの平均値」を抜く
-# スクリーンショットで見えていた 2, 1, 0, 0, 0, 0 の数値
+# Step1: /trends/api/explore でウィジェットトークン取得
 # ==============================
 
-def parse_trend_score(html: str, keyword: str) -> int | None:
-    soup = BeautifulSoup(html, "html.parser")
+def get_widget_token(keyword: str) -> tuple[str | None, str | None]:
+    """
+    explore エンドポイントからTIMESERIESウィジェットの token と request を取得
+    Returns: (token, request_json) or (None, None)
+    """
+    req_payload = json.dumps([{
+        "keyword": keyword,
+        "geo": "JP",
+        "time": "now 1-d"
+    }])
+    url = (
+        f"https://trends.google.co.jp/trends/api/explore"
+        f"?hl=ja&tz=-540"
+        f"&req={urllib.parse.quote(req_payload)}"
+        f"&type=TIMESERIES&property="
+    )
 
-    # ── 方法1: summary-value クラス（平均値表示エリア）──────────
-    # 右側の「インタレストの平均値」の数字
-    for el in soup.select(".summary-value, .summary-value-group, [class*='summary']"):
-        text = el.get_text(strip=True)
-        if re.match(r"^\d+$", text):
-            score = int(text)
-            logging.info(f"[{keyword}] summary-value から取得: {score}")
-            return score
+    raw = fetch_scraperapi(url, label=f"{keyword}[explore]")
+    if not raw:
+        return None, None
 
-    # ── 方法2: script タグ内の JSON データ ──────────────────────
-    # Google Trends はデータを <script> 内に埋め込む場合がある
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        # "averages":[数値] パターン
-        m = re.search(r'"averages"\s*:\s*\[(\d+)', text)
-        if m:
-            score = int(m.group(1))
-            logging.info(f"[{keyword}] script[averages] から取得: {score}")
-            return score
-        # "value":[数値] パターン
-        m = re.search(r'"value"\s*:\s*\[(\d+)\]', text)
-        if m:
-            score = int(m.group(1))
-            logging.info(f"[{keyword}] script[value] から取得: {score}")
-            return score
+    # レスポンスは ")]}'\n{...}" 形式 → 先頭の )]}'\ を除去
+    try:
+        clean = re.sub(r"^\)\]\}'\n", "", raw.strip())
+        data  = json.loads(clean)
 
-    # ── 方法3: widgets データから直接 ────────────────────────────
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        if "TIMESERIES" in text or "interestOverTime" in text:
-            numbers = re.findall(r'"value"\s*:\s*(\d+)', text)
-            if numbers:
-                vals  = [int(n) for n in numbers]
-                avg   = round(sum(vals) / len(vals))
-                logging.info(f"[{keyword}] TIMESERIES から取得: avg={avg} (n={len(vals)})")
-                return avg
+        for widget in data.get("widgets", []):
+            if widget.get("id") == "TIMESERIES":
+                token   = widget.get("token")
+                req_str = json.dumps(widget.get("request", {}))
+                logging.info(f"[{keyword}] token取得成功: {token[:20]}...")
+                return token, req_str
 
-    # ── デバッグ: 取れなかった場合にHTMLの一部をログ出力 ─────────
-    logging.warning(f"[{keyword}] スコア抽出失敗。HTML先頭500文字: {html[:500]}")
-    return None
+        logging.warning(f"[{keyword}] TIMESERIESウィジェットが見つかりません")
+        logging.warning(f"[{keyword}] レスポンス先頭: {raw[:300]}")
+        return None, None
+
+    except Exception as e:
+        logging.warning(f"[{keyword}] explore JSON パース失敗: {e}")
+        logging.warning(f"[{keyword}] レスポンス先頭: {raw[:300]}")
+        return None, None
 
 # ==============================
-# 1キーワードのスコアを取得
+# Step2: /trends/api/widgetdata/multiline でスコア取得
+# ==============================
+
+def get_scores_from_widget(keyword: str, token: str, req_str: str) -> int | None:
+    """
+    multiline エンドポイントから時系列スコアを取得して平均値を返す
+    """
+    url = (
+        f"https://trends.google.co.jp/trends/api/widgetdata/multiline"
+        f"?hl=ja&tz=-540"
+        f"&req={urllib.parse.quote(req_str)}"
+        f"&token={urllib.parse.quote(token)}"
+        f"&property="
+    )
+
+    raw = fetch_scraperapi(url, label=f"{keyword}[multiline]")
+    if not raw:
+        return None
+
+    try:
+        clean = re.sub(r"^\)\]\}'\n", "", raw.strip())
+        data  = json.loads(clean)
+
+        # timelineData から value を抽出
+        timeline = data.get("default", {}).get("timelineData", [])
+        values   = []
+        for point in timeline:
+            v = point.get("value", [])
+            if v:
+                values.append(int(v[0]))
+
+        if not values:
+            logging.warning(f"[{keyword}] timelineData が空")
+            return None
+
+        avg = round(sum(values) / len(values))
+        logging.info(f"[{keyword}] スコア取得成功: avg={avg} (n={len(values)}, max={max(values)})")
+        return avg
+
+    except Exception as e:
+        logging.warning(f"[{keyword}] multiline JSON パース失敗: {e}")
+        logging.warning(f"[{keyword}] レスポンス先頭: {raw[:300]}")
+        return None
+
+# ==============================
+# 1キーワードのスコアを取得（Step1 + Step2）
 # ==============================
 
 def fetch_trend_score(keyword: str) -> int | None:
-    # URLはエンコードせずそのまま渡す（fetch_scraperapi内でまとめてエンコード）
-    url = (
-        f"https://trends.google.co.jp/trends/explore"
-        f"?q={keyword}&geo=JP&hl=ja&date=now+1-d"
-    )
-    logging.info(f"[{keyword}] URL: {url}")
-
-    html = fetch_scraperapi(url, label=keyword)
-    if not html:
-        logging.warning(f"[{keyword}] HTML取得失敗")
+    # Step1: トークン取得
+    token, req_str = get_widget_token(keyword)
+    if not token:
         return None
 
-    return parse_trend_score(html, keyword)
+    time.sleep(random.uniform(2, 4))
+
+    # Step2: スコア取得
+    return get_scores_from_widget(keyword, token, req_str)
 
 # ==============================
 # 全キーワード取得
@@ -209,7 +244,7 @@ def fetch_trends(keywords: list) -> dict:
         logging.info(f"===== 取得中: {kw} =====")
         scores[kw] = fetch_trend_score(kw)
         logging.info(f"[{kw}] → {scores[kw]}")
-        time.sleep(random.uniform(8, 15))  # scraper_pro.py と同じ間隔
+        time.sleep(random.uniform(8, 15))
     return scores
 
 # ==============================
