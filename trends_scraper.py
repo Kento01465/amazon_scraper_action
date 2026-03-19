@@ -100,13 +100,9 @@ def collect_keywords(jan_sheet) -> list:
 # ==============================
 
 def fetch_trends(keywords: list) -> dict:
-    """
-    キーワードリストの直近7日間トレンドスコア（最新日）を返す
-    Returns: { "キーワード": score(int) or None }
-    """
-    pytrends = TrendReq(hl="ja-JP", tz=540)  # 日本語・JST
-    scores   = {}
-    BATCH    = 5  # pytrends は一度に最大5件まで比較可能
+    pytrends = TrendReq(hl="ja-JP", tz=540)
+    scores = {}
+    BATCH = 5
 
     for i in range(0, len(keywords), BATCH):
         batch = keywords[i:i + BATCH]
@@ -121,6 +117,10 @@ def fetch_trends(keywords: list) -> dict:
                 gprop="",
             )
             df = pytrends.interest_over_time()
+
+            # ↓ デバッグ追加
+            logging.info(f"DataFrame shape: {df.shape}")
+            logging.info(f"DataFrame:\n{df.to_string()}")  # 追加
 
             if df.empty:
                 logging.warning(f"データなし: {batch}")
@@ -137,7 +137,7 @@ def fetch_trends(keywords: list) -> dict:
             for kw in batch:
                 scores[kw] = None
 
-        time.sleep(3)  # レート制限対策（scraper_pro.py の sleep と同様）
+        time.sleep(3)
 
     return scores
 

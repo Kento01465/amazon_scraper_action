@@ -1,34 +1,22 @@
-name: amazon-scraper-pro
+name: trends-scraper
 
 on:
   # schedule:
-  #   - cron: "0 0 * * *"  # 毎日 9:00 JST（UTC 0:00）
+  #   - cron: "0 2 * * *"  # 毎日 11:00 JST（Amazon と時間をずらす）
   workflow_dispatch:
 
 jobs:
-  scrape:
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install deps
         run: pip install -r requirements.txt
-
-      # ── Amazon スクレイピング ──────────────────────────────────
-      - name: Run Amazon scraper
-        env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-        run: python scraper_pro.py
-
-      # ── Google Trends 取得（Amazon 完了後に実行）────────────────
       - name: Run Trends scraper
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: python trends_scraper.py
-        continue-on-error: true
